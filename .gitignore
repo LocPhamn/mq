@@ -1,0 +1,10 @@
+# Ignore EVERYTHING
+*
+!.gitignore
+!copy_paster_depth.py
+!copy_paster_depth_for_stockbridge.py
+!custom_module.py
+!
+!labeling.py
+!grounded_sam2_local_demo.py
+
