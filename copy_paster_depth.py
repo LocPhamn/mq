@@ -21,7 +21,8 @@ from labeling import labeling_custom
 import argparse
 from glob import glob
 from copy_paster_config import *
-from image_process import enhance_edges
+from poisson_edit import *
+from color_trans import *
 import requests
 
 # Grounded SAM2 parameters
@@ -208,11 +209,11 @@ def get_region_depth(depth_map, box, ground_mask=None):
         print(f"Total pixels in region: {total_pixels}")
         return mean_depth
     
-def compute_scale(depth_value, min_scale=2.0, max_scale=7.0):
+def compute_scale(depth_value, min_scale=SCALE_MIN, max_scale=SCALE_MAX):
     if isinstance(depth_value, tuple):
         depth_value = depth_value[0]
     scale = min_scale + (max_scale - min_scale) * float(depth_value)
-    return scale
+    return float(np.clip(scale, min_scale, SCALE_HARD_MAX))
 
 def minimum_object_size(obj_img, max_size):
     target_area = max_size * max_size
@@ -226,7 +227,7 @@ def minimum_object_size(obj_img, max_size):
     resized_img = cv2.resize(obj_img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
     return resized_img, resized_img.shape[:2]
 
-def paste_object_with_alpha(bg_path, bg_img, obj_rgba,alpha_path, ground_polygon, depth_map, mask, colored, boxes, triangle_pts):
+def paste_object_with_alpha(bg_img, obj_rgba,alpha_path, ground_polygon, depth_map, mask, colored, boxes, triangle_pts):
     """ Params:
         bg_img: ảnh background (PIL Image)
         obj_rgba: ảnh object với kênh alpha (numpy array)
@@ -239,14 +240,14 @@ def paste_object_with_alpha(bg_path, bg_img, obj_rgba,alpha_path, ground_polygon
         final_bbox: bounding box của object đã paste [x1, y1, x2, y2]
         
         """
-    bg_img = np.array(bg_img)
-    obj_rgba, (h, w) = minimum_object_size(obj_rgba, max_size=MINIMUM_IMAGE_SIZE)
+    attempt_img = obj_rgba.copy()
+    attempt_image, (h, w) = minimum_object_size(attempt_img, max_size=MINIMUM_IMAGE_SIZE)
     rows, cols = np.where(mask == 1)
     points = np.column_stack((cols, rows))
     alpha_name = os.path.basename(alpha_path)
     full_path = "alpha_full_images/"+alpha_name
     
-    
+
     idx = None
     bl_point = None
     
@@ -313,51 +314,53 @@ def paste_object_with_alpha(bg_path, bg_img, obj_rgba,alpha_path, ground_polygon
     print("----------------------------------------------------------")
 
     obj_resized = cv2.resize(obj_rgba, new_size, interpolation=cv2.INTER_CUBIC)
-    sharp_obj = enhance_edges(obj_resized)
-    obj_resized = cv2.cvtColor(sharp_obj, cv2.COLOR_BGRA2RGBA)
     
     # Tìm polygon từ alpha mask của object
     obj_polygon, obj_contour = get_polygon_from_alpha_mask(obj_resized, num_points_range=(4, 6))
-    
-    alpha_layer = np.zeros((bg_height, bg_width, 4), dtype=np.uint8)
-    
+        
     actual_paste_h = paste_end_y - paste_start_y
     actual_paste_w = paste_end_x - paste_start_x
     obj_h, obj_w = obj_resized.shape[:2]
-    
-    if obj_h != actual_paste_h or obj_w != actual_paste_w:
-        obj_resized = obj_resized[:actual_paste_h, :actual_paste_w]
-        obj_h, obj_w = actual_paste_h, actual_paste_w
     
     depth_crop = depth_map[paste_start_y:paste_end_y, paste_start_x:paste_end_x]
     
     if depth_crop.shape[0] > 0 and depth_crop.shape[1] > 0:
         depth_resized = cv2.resize(depth_crop, (obj_w, obj_h), 
                                    interpolation=cv2.INTER_LINEAR)
-        
         # Apply occlusion mask
         occlusion_mask = depth_resized > depth_val        
         obj_resized[:, :, 3][occlusion_mask] = 0
     
-    # Paste object_resized lên alpha_layer tại tọa độ (paste_start_x, paste_start_y)
-    alpha_layer[paste_start_y:paste_end_y, paste_start_x:paste_end_x] = obj_resized
-    # Convert sang PIL để xử lý
-    bg_img = cv2.cvtColor(bg_img, cv2.COLOR_BGR2RGB)
-    bg_img_pil = Image.fromarray(bg_img)
-    alpha_layer_pil = Image.fromarray(alpha_layer)
-    alpha_layer_pil.save(full_path)
-    
     # Apply color matching nếu cần
     if colored == "y":
-        mean_bg_color = get_mean_color(bg_img, final_bbox)
-        obj_crop = alpha_layer_pil.crop((paste_start_x, paste_start_y, paste_end_x, paste_end_y))
-        obj_crop_blended = color_transfer_blend(obj_crop, bg_img_pil, mean_bg_color, alpha=0.5)
-        alpha_layer_array = np.array(alpha_layer_pil)
-        alpha_layer_array[paste_start_y:paste_end_y, paste_start_x:paste_end_x] = np.array(obj_crop_blended)
-        alpha_layer_pil = Image.fromarray(alpha_layer_array)
+        lightness_obj = lightness_matching(obj_resized, bg_img, paste_start_y, paste_end_y, paste_start_x, paste_end_x)
+        # obj_blend = color_trans(obj_resized, bg_img)
+        obj_crop_blended = color_transfer_blend(object_mean_color, bg_img, mean_bg_color, alpha=0.2)
+
+        # mean_bg_color = get_mean_color(bg_img, final_bbox)
+        obj_blend = pytorch_color_trans(input_image=obj_resized, ref_image=bg_img)
+        source_rgba = np.array(obj_blend, dtype=np.uint8)
+    else:
+        source_rgba = obj_resized
+
+    # Poisson function expects source/target with matching channel order.
+    # Here target is BGR, so convert source from RGBA -> BGRA.
+    source_for_poisson = cv2.cvtColor(source_rgba, cv2.COLOR_RGBA2BGRA)
+    source_mask_poisson = source_for_poisson[:, :, 3] > 0
     
-    # Paste toàn bộ alpha_layer vào background
-    bg_img_pil.paste(alpha_layer_pil, (0, 0), alpha_layer_pil)
+    blend_img = poisson_image_editing(source_for_poisson, bg_img, (paste_start_y, paste_start_x))
+    
+    # blend_img = poisson_image_editing_mixing_gradients(
+    #     source=source_for_poisson,
+    #     target=bg_img,
+    #     source_mask=source_mask_poisson,
+    #     target_mask=np.ones(bg_img.shape[:2], dtype=bool),
+    #     offset=(paste_start_y, paste_start_x),
+    #     source_opacity=1.0,
+    #     gradient_mode="source",
+    #     mask_threshold=20,
+    # )
+    blend_img_pil = Image.fromarray(cv2.cvtColor(blend_img, cv2.COLOR_BGR2RGB))
     
     # Vẽ polygon của object lên background (nếu tìm được)
     adjusted_polygon = None
@@ -382,7 +385,7 @@ def paste_object_with_alpha(bg_path, bg_img, obj_rgba,alpha_path, ground_polygon
         # Convert lại sang PIL
         # bg_img_pil = Image.fromarray(bg_array)
 
-    return bg_img_pil, (paste_start_x, paste_start_y, paste_end_x, paste_end_y), adjusted_polygon
+    return blend_img_pil, (paste_start_x, paste_start_y, paste_end_x, paste_end_y), adjusted_polygon
 
 def find_smallest_angle_point(polygon):
    
@@ -604,7 +607,7 @@ if __name__ == '__main__':
     hunyuan_url = args.hunyuan_url
     hunyuan_output_dir = args.hunyuan_output_dir
     all_num_objects = num_images + (num_images // 2)
-    alpha_folder = "alpha_images"
+    alpha_folder = "alpha_clean"
     rotate_alpha_folder = r"generated_images/3d"
     # texture_files = [f for f in os.listdir(rotate_alpha_folder) if f.startswith("textured_") and f.endswith(".glb")]
     # print(f"Found {len(texture_files)} textured alpha files in '{rotate_alpha_folder}'")
@@ -630,17 +633,17 @@ if __name__ == '__main__':
     #     crop_vehicle(path,idx)
 
     # --LOAD ALPHA IMAGES DIRECTLY (alpha images already prepared)---
-    # alpha_paths = [
-    #     os.path.join(alpha_folder, f)
-    #     for f in os.listdir(alpha_folder)
-    #     if f.lower().endswith(".png")
-    # ]
-    # -- Load ảnh alpha ở alpha_folder đã có texture ở folder 3d
     alpha_paths = [
-        os.path.join(alpha_folder, f.replace("textured_", "").replace(".glb", ".png"))
-        for f in os.listdir(rotate_alpha_folder)
-        if f.lower().endswith(".glb") and f.startswith("textured_")
+        os.path.join(alpha_folder, f)
+        for f in os.listdir(alpha_folder)
+        if f.lower().endswith(".png")
     ]
+    # -- Load ảnh alpha ở alpha_folder đã có texture ở folder 3d
+    # alpha_paths = [
+    #     os.path.join(alpha_folder, f.replace("textured_", "").replace(".glb", ".png"))
+    #     for f in os.listdir(rotate_alpha_folder)
+    #     if f.lower().endswith(".glb") and f.startswith("textured_")
+    # ]
     
     print(f"Loaded {len(alpha_paths)} alpha images from '{alpha_folder}'")
     if not alpha_paths:
@@ -733,16 +736,17 @@ if __name__ == '__main__':
         cv2.polylines(bg_img, [pts_new], isClosed=True, color=(0,255,0), thickness=2)
         cv2.drawContours(bg_img, [largest], -1, color=(255,0,0), thickness=2)
     cv2.imwrite("ground_mask_visualization.png", bg_img)
+    
     # ---GENERATE IMAGES---
     for i in range(num_images):
         boxes = []
         polygons = []  # Lưu polygon của mỗi object
 
-        # alpha_path_process = alpha_paths[i:i+num_objects] 
+        alpha_path_process = alpha_paths[i:i+num_objects] 
         # alpha_path_process = [alpha_paths[0]] * num_objects
-        alpha_path_process = random.sample(alpha_paths, min(num_objects, len(alpha_paths))) \
-            if len(alpha_paths) >= num_objects \
-            else random.choices(alpha_paths, k=num_objects)
+        # alpha_path_process = random.sample(alpha_paths, min(num_objects, len(alpha_paths))) \
+        #     if len(alpha_paths) >= num_objects \
+        #     else random.choices(alpha_paths, k=num_objects)
 
         print(f"Processing image {i+1}/{num_images}")
         print("len of alpha paths:", len(alpha_path_process))
@@ -759,7 +763,7 @@ if __name__ == '__main__':
             
             """ obstacles paste"""
             new_bg_img, (x1, y1, x2, y2), obj_polygon = paste_object_with_alpha(
-                img_bg_path, new_bg_img, alpha_img, alpha_path, ground_polygon, depth_map, 
+                new_bg_img, alpha_img, alpha_path, ground_polygon, depth_map, 
                 ground_mask, colored, boxes=boxes, triangle_pts=triangle_area
             )
             boxes.append([x1, y1, x2, y2])
@@ -787,82 +791,82 @@ if __name__ == '__main__':
 
             # ===== Log góc giữa P1→P2 và P1→P2' =====
             
-            P1 = np.array(box_3d_points[P1_IDX], dtype=float)   # bottom_front_right
-            P2 = np.array(box_3d_points[P2_IDX], dtype=float)   # bottom_back_right
-            dx_offset, dy_offset = DX_OFFSET, DY_OFFSET
-            P2_prime = P1 + np.array([dx_offset, dy_offset], dtype=float)
+            # P1 = np.array(box_3d_points[P1_IDX], dtype=float)   # bottom_front_right
+            # P2 = np.array(box_3d_points[P2_IDX], dtype=float)   # bottom_back_right
+            # dx_offset, dy_offset = DX_OFFSET, DY_OFFSET
+            # P2_prime = P1 + np.array([dx_offset, dy_offset], dtype=float)
 
-            v_P1_P2       = P2 - P1
-            v_P1_P2_prime = P2_prime - P1
+            # v_P1_P2       = P2 - P1
+            # v_P1_P2_prime = P2_prime - P1
 
-            len_v1 = np.linalg.norm(v_P1_P2)
-            len_v2 = np.linalg.norm(v_P1_P2_prime)
+            # len_v1 = np.linalg.norm(v_P1_P2)
+            # len_v2 = np.linalg.norm(v_P1_P2_prime)
             
-            x_rotate_degree = get_rotate_degree_cross_line(va_pts, P1, [va_pts, P2_prime])            
+            # x_rotate_degree = get_rotate_degree_cross_line(va_pts, P1, [va_pts, P2_prime])            
 
-            if len_v1 > 1e-6 and len_v2 > 1e-6:
-                cos_a = np.dot(v_P1_P2, v_P1_P2_prime) / (len_v1 * len_v2)
-                angle_P1P2_P1P2prime = np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0)))
-                print(f"[ANGLE] P1={tuple(P1.astype(int))}, P2={tuple(P2.astype(int))}, P2'={tuple(P2_prime.astype(int))}")
-                print(f"[ANGLE] vec P1→P2       = {v_P1_P2.tolist()}")
-                print(f"[ANGLE] vec P1→P2'      = {v_P1_P2_prime.tolist()}")
-                print(f"[ANGLE] Góc P1P2 vs P1P2' = {angle_P1P2_P1P2prime:.2f}°")
-                print(f"[ANGLE] X ROTATION = {x_rotate_degree:.2f}°")
-            else:
-                print("[ANGLE] Không tính được góc (vector có độ dài = 0)")
+            # if len_v1 > 1e-6 and len_v2 > 1e-6:
+            #     cos_a = np.dot(v_P1_P2, v_P1_P2_prime) / (len_v1 * len_v2)
+            #     angle_P1P2_P1P2prime = np.degrees(np.arccos(np.clip(cos_a, -1.0, 1.0)))
+            #     print(f"[ANGLE] P1={tuple(P1.astype(int))}, P2={tuple(P2.astype(int))}, P2'={tuple(P2_prime.astype(int))}")
+            #     print(f"[ANGLE] vec P1→P2       = {v_P1_P2.tolist()}")
+            #     print(f"[ANGLE] vec P1→P2'      = {v_P1_P2_prime.tolist()}")
+            #     print(f"[ANGLE] Góc P1P2 vs P1P2' = {angle_P1P2_P1P2prime:.2f}°")
+            #     print(f"[ANGLE] X ROTATION = {x_rotate_degree:.2f}°")
+            # else:
+            #     print("[ANGLE] Không tính được góc (vector có độ dài = 0)")
 
-            if send_hunyuan:
-                flip_deg = random.choice([0, 180])
-                yaw_deg = normalize_yaw(angle_P1P2_P1P2prime + flip_deg) 
-                pitch_deg = normalize_yaw(x_rotate_degree)
-                alpha_path = alpha_path_process[idx] if idx < len(alpha_path_process) else None
-                if alpha_path:
-                    result = send_to_hunyuan3d(alpha_path, int(yaw_deg), hunyuan_url, hunyuan_output_dir, int(pitch_deg),turn=1)
-                    if result is None:
-                        print(f"[SKIP] Hunyuan3D failed for {alpha_path}, skipping rotate paste.")
-                        continue
+            # if send_hunyuan:
+            #     flip_deg = random.choice([0, 180])
+            #     yaw_deg = normalize_yaw(angle_P1P2_P1P2prime + flip_deg) 
+            #     pitch_deg = normalize_yaw(x_rotate_degree)
+            #     alpha_path = alpha_path_process[idx] if idx < len(alpha_path_process) else None
+            #     if alpha_path:
+            #         result = send_to_hunyuan3d(alpha_path, int(yaw_deg), hunyuan_url, hunyuan_output_dir, int(pitch_deg),turn=1)
+            #         if result is None:
+            #             print(f"[SKIP] Hunyuan3D failed for {alpha_path}, skipping rotate paste.")
+            #             continue
 
-                    rotate_alpha_path = f"{rotate_alpha_folder}/{os.path.basename(alpha_path).replace('.png', '_view.png')}"
-                    print(f"Rotate alpha path: {rotate_alpha_path}")
+            #         rotate_alpha_path = f"{rotate_alpha_folder}/{os.path.basename(alpha_path).replace('.png', '_view.png')}"
+            #         print(f"Rotate alpha path: {rotate_alpha_path}")
 
-                    if not wait_for_file(rotate_alpha_path, timeout=900, poll_interval=2.0):
-                        print(f"[SKIP] Output file not ready: {rotate_alpha_path}, skipping rotate paste.")
-                        continue
+            #         if not wait_for_file(rotate_alpha_path, timeout=900, poll_interval=2.0):
+            #             print(f"[SKIP] Output file not ready: {rotate_alpha_path}, skipping rotate paste.")
+            #             continue
 
-                    rotate_alpha_img = cv2.imread(rotate_alpha_path, cv2.IMREAD_UNCHANGED)
-                    if rotate_alpha_img is None:
-                        print(f"[SKIP] Could not read {rotate_alpha_path}, skipping rotate paste.")
-                        continue
-                    rotate_alpha_img, bbox = get_tight_bbox_from_alpha(rotate_alpha_img)
-                    rotate_alpha_img = cv2.cvtColor(rotate_alpha_img, cv2.COLOR_BGRA2RGBA)
+            #         rotate_alpha_img = cv2.imread(rotate_alpha_path, cv2.IMREAD_UNCHANGED)
+            #         if rotate_alpha_img is None:
+            #             print(f"[SKIP] Could not read {rotate_alpha_path}, skipping rotate paste.")
+            #             continue
+            #         rotate_alpha_img, bbox = get_tight_bbox_from_alpha(rotate_alpha_img)
+            #         rotate_alpha_img = cv2.cvtColor(rotate_alpha_img, cv2.COLOR_BGRA2RGBA)
 
-                    new_bg_img = Image.fromarray(cv_img)
-                    new_bg_img, (r_x1, r_y1, r_x2, r_y2), obj_polygon = paste_object_with_alpha(
-                        img_bg_path, new_bg_img, rotate_alpha_img, rotate_alpha_path, ground_polygon, depth_map,
-                        ground_mask, colored, boxes=boxes, triangle_pts=triangle_area
-                    )
-                    boxes.append([r_x1, r_y1, r_x2, r_y2])
-                    polygons.append(obj_polygon)
+            #         new_bg_img = Image.fromarray(cv_img)
+            #         new_bg_img, (r_x1, r_y1, r_x2, r_y2), obj_polygon = paste_object_with_alpha(
+            #             img_bg_path, new_bg_img, rotate_alpha_img, rotate_alpha_path, ground_polygon, depth_map,
+            #             ground_mask, colored, boxes=boxes, triangle_pts=triangle_area
+            #         )
+            #         boxes.append([r_x1, r_y1, r_x2, r_y2])
+            #         polygons.append(obj_polygon)
 
-                    labeling_custom(img_bg_path, f"{img_folder}/out_{i+1}.png", rotate_alpha_path,
-                                r_x1/new_bg_img.width, r_y1/new_bg_img.height,
-                                r_x2/new_bg_img.width, r_y2/new_bg_img.height)
+            #         labeling_custom(img_bg_path, f"{img_folder}/out_{i+1}.png", rotate_alpha_path,
+            #                     r_x1/new_bg_img.width, r_y1/new_bg_img.height,
+            #                     r_x2/new_bg_img.width, r_y2/new_bg_img.height)
 
-                    box = [r_x1, r_y1, r_x2, r_y2]
-                    box_depth = get_box_depth(depth_map, box)
-                    box_3d_points = create_3d_box_from_mask(
-                        [r_x1, r_y1, r_x2, r_y2], box_depth, 
-                        image=cv_img, 
-                        height_scale=1.2,
-                        vanishing_point=va_pts  
-                    )
-                    cv_img = np.array(new_bg_img)
+            #         box = [r_x1, r_y1, r_x2, r_y2]
+            #         box_depth = get_box_depth(depth_map, box)
+            #         box_3d_points = create_3d_box_from_mask(
+            #             [r_x1, r_y1, r_x2, r_y2], box_depth, 
+            #             image=cv_img, 
+            #             height_scale=1.2,
+            #             vanishing_point=va_pts  
+            #         )
+            #         cv_img = np.array(new_bg_img)
         #             cv_img = draw_3d_box(cv_img, box_3d_points, color=(0, 255, 0), thickness=2,
         #             triangle_pts=triangle_area)
         # cv_img = np.array(new_bg_img)
 
             
-        if num_objects % 2 == 1:
+        if num_objects % 2 == 0:
             cv2.imwrite(f'{img_folder}/out_{i+1}.png',cv_img)
         else:
             Image.fromarray(cv_img).save(f'{img_folder}/out_{i+1}.png')

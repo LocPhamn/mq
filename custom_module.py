@@ -605,7 +605,7 @@ def get_mean_histogram(hist, top_idx):
     mean_hist = sum(sum_hist) / sum(sum_pixel)
     return mean_hist
 
-def lightness_matching(obj_img,bg_img,paste_start_y,paste_end_y,paste_start_x,paste_end_x,top_idx=5):
+def lightness_matching(obj_img,bg_img,paste_start_y,paste_end_y,paste_start_x,paste_end_x,top_idx=20):
     """
     obj_img: PIL Image hoặc numpy array với 4 kênh (RGBA)
     bg_img: PIL Image hoặc numpy array (RGB hoặc RGBA) - will be resized to obj size if needed
@@ -656,7 +656,7 @@ def lightness_matching(obj_img,bg_img,paste_start_y,paste_end_y,paste_start_x,pa
     obj_mean_hist = get_mean_histogram(obj_hist_list, top_obj_idx)
     bg_mean_hist = get_mean_histogram(bg_hist_list, top_bg_idx)
 
-    value_change = float(bg_mean_hist - 1 * obj_mean_hist)
+    value_change = float(bg_mean_hist - 1* obj_mean_hist)
     
     print(f"Object mean V: {obj_mean_hist}, Background mean V: {bg_mean_hist}, Value change: {value_change}")
 
