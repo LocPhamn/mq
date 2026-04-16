@@ -114,7 +114,7 @@ def labeling_custom(bg_path,img_path, label, x1, y1, x2, y2):
     bg_label_path = os.path.join(bg_label, f"{base_name}.txt")
     copy_label_path = os.path.join(root, f"{img_name}.txt")
 
-    print(f"Labeling {copy_label_path} with object from {bg_label_path}")
+    print(f"Labeling {copy_label_path} with object from {label}")
 
     if not os.path.exists(bg_label_path):
         with open(bg_label_path, 'w') as f:

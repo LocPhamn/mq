@@ -14,6 +14,8 @@ import argparse
 
 parser = argparse.ArgumentParser(description="Training script")
 parser.add_argument("--image_path","-i",type=str, default="bg (6).png", help="Path to the input image")
+parser.add_argument("--image_root", type=str, default="images/bg_images", help="Root folder when --image_path is just a file name")
+parser.add_argument("--predict_repeats", type=int, default=1, help="Number of repeated GDINO predicts per image")
 
 agrs = parser.parse_args()
 
@@ -21,8 +23,34 @@ agrs = parser.parse_args()
 Hyper parameters
 """
 
-TEXT_PROMPT = "yellow wall. ground."
-IMG_PATH = f"images/bg_images/{agrs.image_path}"
+TEXT_PROMPT = "yellow wall. ground. road. asphalt. pavement. sidewalk. dirt. soil. gravel. stone ground. floor. drivable surface."
+
+GROUND_SYNONYMS = (
+    "ground",
+    "road",
+    "asphalt",
+    "pavement",
+    "sidewalk",
+    "dirt",
+    "soil",
+    "gravel",
+    "stone",
+    "floor",
+    "drivable",
+)
+
+
+def resolve_image_path(image_path_arg, image_root):
+    p = Path(image_path_arg)
+    if p.exists():
+        return str(p)
+    candidate = Path(image_root) / image_path_arg
+    if candidate.exists():
+        return str(candidate)
+    raise FileNotFoundError(f"Image not found: {image_path_arg} (also checked {candidate})")
+
+
+IMG_PATH = resolve_image_path(agrs.image_path, agrs.image_root)
 SAM2_CHECKPOINT = "./checkpoints/sam2.1_hiera_large.pt"
 SAM2_MODEL_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 GROUNDING_DINO_CONFIG = "grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py"
@@ -63,7 +91,8 @@ img_path = IMG_PATH
 image_source, image = load_image(img_path)
 
 sam2_predictor.set_image(image_source)
-for i in range(0, 1000):
+boxes, confidences, labels = None, None, None
+for _ in range(max(1, int(agrs.predict_repeats))):
     boxes, confidences, labels = predict(
         model=grounding_model,
         image=image,
@@ -101,16 +130,68 @@ Post-process the output of the model to get the masks, scores, and logits for vi
 if masks.ndim == 4:
     masks = masks.squeeze(1)
 
+masks = masks.astype(bool)
+confidences = confidences.detach().cpu().numpy().astype(float).tolist()
+raw_class_names = [str(x) for x in labels]
 
-confidences = confidences.numpy().tolist()
-class_names = labels
 
-class_ids = np.array(list(range(len(class_names))))
+def normalize_label(name):
+    label = name.lower().strip().replace("_", " ").replace("-", " ").rstrip(".")
+    if any(keyword in label for keyword in GROUND_SYNONYMS):
+        return "ground"
+    return label
+
+
+normalized_class_names = [normalize_label(name) for name in raw_class_names]
+ground_indices = [i for i, name in enumerate(normalized_class_names) if name == "ground"]
+
+has_ground_mask = False
+if len(ground_indices) > 0 and len(masks) > 0:
+    merged_ground = np.zeros((h, w), dtype=bool)
+    for idx in ground_indices:
+        merged_ground |= masks[idx]
+
+    if merged_ground.any():
+        gy, gx = np.where(merged_ground)
+        merged_ground_box = np.array(
+            [
+                float(gx.min()),
+                float(gy.min()),
+                float(gx.max()),
+                float(gy.max()),
+            ],
+            dtype=np.float32,
+        )
+        merged_ground_score = float(max(confidences[idx] for idx in ground_indices))
+
+        keep_indices = [i for i in range(len(normalized_class_names)) if i not in ground_indices]
+        merged_masks = [masks[i] for i in keep_indices]
+        merged_boxes = [input_boxes[i] for i in keep_indices]
+        merged_scores = [float(confidences[i]) for i in keep_indices]
+        merged_names = [normalized_class_names[i] for i in keep_indices]
+
+        merged_masks.append(merged_ground)
+        merged_boxes.append(merged_ground_box)
+        merged_scores.append(merged_ground_score)
+        merged_names.append("ground")
+
+        masks = np.stack(merged_masks, axis=0)
+        input_boxes = np.stack(merged_boxes, axis=0).astype(np.float32)
+        confidences = merged_scores
+        class_names = merged_names
+        has_ground_mask = True
+    else:
+        print("[WARN] Ground-like labels found but merged ground mask is empty.")
+        class_names = normalized_class_names
+else:
+    print("[WARN] No ground-like detections found. Fallback: keep original detections.")
+    class_names = normalized_class_names
+
+class_ids = np.array(list(range(len(class_names))), dtype=np.int32)
 
 labels = [
     f"{class_name} {confidence:.2f}"
-    for class_name, confidence
-    in zip(class_names, confidences)
+    for class_name, confidence in zip(class_names, confidences)
 ]
 
 """
@@ -151,7 +232,7 @@ if DUMP_JSON_RESULTS:
     mask_rles = [single_mask_to_rle(mask) for mask in masks]
 
     input_boxes = input_boxes.tolist()
-    scores = scores.tolist()
+    scores = [float(x) for x in confidences]
     # save the results in standard format
     results = {
         "image_path": img_path,
@@ -167,6 +248,7 @@ if DUMP_JSON_RESULTS:
         "box_format": "xyxy",
         "img_width": w,
         "img_height": h,
+        "has_ground_mask": has_ground_mask,
     }
     
     with open(os.path.join(OUTPUT_DIR, f"{base_filename}_results.json"), "w") as f:

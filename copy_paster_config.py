@@ -1,5 +1,5 @@
 
-MINIMUM_IMAGE_SIZE = 64
+MINIMUM_IMAGE_SIZE = 84
 BOUDING_BOX_THRESHOLD = 0.3
 
 # Scale controls for depth-based object resizing.

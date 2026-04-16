@@ -605,75 +605,59 @@ def get_mean_histogram(hist, top_idx):
     mean_hist = sum(sum_hist) / sum(sum_pixel)
     return mean_hist
 
-def lightness_matching(obj_img,bg_img,paste_start_y,paste_end_y,paste_start_x,paste_end_x,top_idx=20):
+def lightness_matching_v2(obj_img, bg_img, paste_start_y, paste_end_y, paste_start_x, paste_end_x):
     """
-    obj_img: PIL Image hoặc numpy array với 4 kênh (RGBA)
-    bg_img: PIL Image hoặc numpy array (RGB hoặc RGBA) - will be resized to obj size if needed
-    top_idx: số bins hàng đầu để tính mean histogram
-    Trả về: PIL Image (RGBA) với lightness (V) đã được điều chỉnh
+    Histogram matching thực sự: map toàn bộ phân phối V của obj → phân phối V của bg.
+    Robust hơn so với shift tuyến tính, không bị clip tại 0/255.
     """
-    # Convert to numpy
     obj_arr = np.array(obj_img)
-    bg_arr = np.array(bg_img)
-    
+    bg_arr  = np.array(bg_img)
+
     bg_h, bg_w = bg_arr.shape[:2]
-    paste_start_y = int(max(0, min(paste_start_y, bg_h)))
-    paste_end_y = int(max(0, min(paste_end_y, bg_h)))
-    paste_start_x = int(max(0, min(paste_start_x, bg_w)))
-    paste_end_x = int(max(0, min(paste_end_x, bg_w)))
-    
-    bg_arr = bg_arr[paste_start_y:paste_end_y, paste_start_x:paste_end_x]
-  
-    alpha = obj_arr[:, :, 3]
+    y0 = int(np.clip(paste_start_y, 0, bg_h))
+    y1 = int(np.clip(paste_end_y,   0, bg_h))
+    x0 = int(np.clip(paste_start_x, 0, bg_w))
+    x1 = int(np.clip(paste_end_x,   0, bg_w))
+    bg_crop = bg_arr[y0:y1, x0:x1]
 
-    # Use only RGB channels for HSV conversion
-    obj_rgb = obj_arr[:, :, :3].astype(np.uint8)
-    bg_rgb = bg_arr[:, :, :3].astype(np.uint8)
-
-    # Convert to HSV (input assumed RGB)
-    obj_hsv = cv2.cvtColor(obj_rgb, cv2.COLOR_RGB2HSV)
-    bg_hsv = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2HSV)
-
-    obj_v = obj_hsv[:, :, 2]
-    bg_v = bg_hsv[:, :, 2]
-
-    # Build mask of object pixels (alpha > 0)
-    obj_mask = (alpha > 0).astype(np.uint8)
-    # bg_mask = cv2.cvtColor(bg_rgb, cv2.COLOR_RGB2GRAY)
+    alpha   = obj_arr[:, :, 3]
+    obj_mask = alpha > 0
 
     if obj_mask.sum() == 0:
         return Image.fromarray(obj_arr, 'RGBA')
 
-    obj_hist = cv2.calcHist([obj_v], [0], obj_mask, [256], [0, 256])
-    bg_hist = cv2.calcHist([bg_v], [0], None, [256], [0, 256])
+    obj_hsv = cv2.cvtColor(obj_arr[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2HSV)
+    bg_hsv  = cv2.cvtColor(bg_crop[:, :, :3].astype(np.uint8), cv2.COLOR_RGB2HSV)
 
-    obj_hist_list = [float(i[0]) for i in obj_hist]
-    bg_hist_list = [float(i[0]) for i in bg_hist]
+    obj_v = obj_hsv[:, :, 2].astype(np.float32)
+    bg_v  = bg_hsv[:, :, 2].astype(np.float32)
 
-    top_obj_idx = np.argsort(obj_hist_list)[-top_idx:][::-1]
-    top_bg_idx = np.argsort(bg_hist_list)[-top_idx:][::-1]
+    # CDF của obj (chỉ pixel có alpha > 0)
+    obj_vals = obj_v[obj_mask]
+    obj_hist, _ = np.histogram(obj_vals, bins=256, range=(0, 256))
+    obj_cdf = obj_hist.cumsum()
+    obj_cdf = obj_cdf / obj_cdf[-1]           # normalize → [0, 1]
 
-    obj_mean_hist = get_mean_histogram(obj_hist_list, top_obj_idx)
-    bg_mean_hist = get_mean_histogram(bg_hist_list, top_bg_idx)
+    # CDF của bg (toàn bộ crop)
+    bg_vals = bg_v.ravel()
+    bg_hist, _ = np.histogram(bg_vals, bins=256, range=(0, 256))
+    bg_cdf = bg_hist.cumsum()
+    bg_cdf = bg_cdf / bg_cdf[-1]
 
-    value_change = float(bg_mean_hist - 1* obj_mean_hist)
-    
-    print(f"Object mean V: {obj_mean_hist}, Background mean V: {bg_mean_hist}, Value change: {value_change}")
+    # Build lookup table: với mỗi bin obj, tìm bin bg có CDF gần nhất
+    lut = np.searchsorted(bg_cdf, obj_cdf).astype(np.uint8)
 
-    new_hsv = obj_hsv.copy().astype(np.float32)
-    new_v = new_hsv[:, :, 2]
-    new_v = np.clip(new_v + value_change, 0, 255)
-    new_v[obj_mask == 0] = obj_hsv[:, :, 2][obj_mask == 0]
-    new_hsv[:, :, 2] = new_v
+    # Áp dụng LUT lên V channel (chỉ pixel trong mask)
+    new_v = obj_v.copy()
+    src   = obj_v[obj_mask].astype(np.uint8)
+    new_v[obj_mask] = lut[src].astype(np.float32)
 
-    # Back to uint8 and convert to RGB
-    new_hsv = new_hsv.astype(np.uint8)
+    new_hsv = obj_hsv.copy()
+    new_hsv[:, :, 2] = np.clip(new_v, 0, 255).astype(np.uint8)
     new_rgb = cv2.cvtColor(new_hsv, cv2.COLOR_HSV2RGB)
 
-    # Reattach alpha and return PIL Image RGBA
     out_arr = np.dstack([new_rgb, alpha]).astype(np.uint8)
-    out_img = Image.fromarray(out_arr, 'RGBA')
-    return out_img
+    return Image.fromarray(out_arr, 'RGBA')
 
 def get_mean_color(image,box):
     pad = 40  # mở rộng vùng lấy mẫu

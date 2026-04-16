@@ -227,6 +227,45 @@ def minimum_object_size(obj_img, max_size):
     resized_img = cv2.resize(obj_img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
     return resized_img, resized_img.shape[:2]
 
+def color_trans_tiled(obj_resized, bg_crop, grid=4):
+    """
+    Chia obj_resized và bg_crop thành grid x grid tiles,
+    chạy pytorch_color_trans từng tile, ghép lại.
+    """
+    obj_h, obj_w = obj_resized.shape[:2]
+    
+    # Resize bg_crop về cùng kích thước obj nếu khác
+    if bg_crop.shape[:2] != (obj_h, obj_w):
+        bg_crop_r = cv2.resize(bg_crop, (obj_w, obj_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        bg_crop_r = bg_crop
+
+    tile_h = obj_h // grid
+    tile_w = obj_w // grid
+
+    result = np.zeros_like(obj_resized)
+
+    for row in range(grid):
+        for col in range(grid):
+            y1 = row * tile_h
+            x1 = col * tile_w
+            # Tile cuối lấy hết phần còn lại (tránh mất pixel do integer division)
+            y2 = obj_h if row == grid - 1 else y1 + tile_h
+            x2 = obj_w if col == grid - 1 else x1 + tile_w
+
+            obj_tile = obj_resized[y1:y2, x1:x2]
+            bg_tile  = bg_crop_r[y1:y2, x1:x2]
+
+            # Bỏ qua tile nếu obj tile hoàn toàn transparent
+            if obj_tile.shape[2] == 4 and np.all(obj_tile[:, :, 3] == 0):
+                result[y1:y2, x1:x2] = obj_tile
+                continue
+
+            processed_tile = pytorch_color_trans(input_image=obj_tile, ref_image=bg_tile)
+            result[y1:y2, x1:x2] = np.array(processed_tile, dtype=np.uint8)
+
+    return result
+
 def paste_object_with_alpha(bg_img, obj_rgba,alpha_path, ground_polygon, depth_map, mask, colored, boxes, triangle_pts):
     """ Params:
         bg_img: ảnh background (PIL Image)
@@ -246,6 +285,7 @@ def paste_object_with_alpha(bg_img, obj_rgba,alpha_path, ground_polygon, depth_m
     points = np.column_stack((cols, rows))
     alpha_name = os.path.basename(alpha_path)
     full_path = "alpha_full_images/"+alpha_name
+    attempt = 1000
     
 
     idx = None
@@ -260,6 +300,7 @@ def paste_object_with_alpha(bg_img, obj_rgba,alpha_path, ground_polygon, depth_m
         return bg_img, (0,0,0,0)
     
     bg_height, bg_width = bg_img.shape[:2]
+    depth_max = np.max(depth_map)
     
     # Vòng lặp tìm vị trí phù hợp
     while True:
@@ -306,6 +347,10 @@ def paste_object_with_alpha(bg_img, obj_rgba,alpha_path, ground_polygon, depth_m
         idx = np.random.choice(len(points), 1, replace=False)
         bl_point = points[idx][0]
         print("points is not suitable, reselecting...")
+        attempt -= 1
+        if attempt <= 0:
+            print("Failed to find suitable paste location after many attempts.")
+            return None , (0,0,0,0) , None
     
     print(f"Paste region: [{paste_start_x}, {paste_start_y}, {paste_end_x}, {paste_end_y}]")
     print(f"Depth value at paste region: {depth_val:.3f}")
@@ -324,21 +369,87 @@ def paste_object_with_alpha(bg_img, obj_rgba,alpha_path, ground_polygon, depth_m
     
     depth_crop = depth_map[paste_start_y:paste_end_y, paste_start_x:paste_end_x]
     
-    if depth_crop.shape[0] > 0 and depth_crop.shape[1] > 0:
-        depth_resized = cv2.resize(depth_crop, (obj_w, obj_h), 
-                                   interpolation=cv2.INTER_LINEAR)
-        # Apply occlusion mask
-        occlusion_mask = depth_resized > depth_val        
-        obj_resized[:, :, 3][occlusion_mask] = 0
+    # if depth_crop.shape[0] > 0 and depth_crop.shape[1] > 0:
+    #     depth_resized = cv2.resize(depth_crop, (obj_w, obj_h), interpolation=cv2.INTER_LINEAR)
+    #     # Apply occlusion mask
+    #     occlusion_mask = depth_resized > depth_max        
+    #     obj_resized[:, :, 3][occlusion_mask] = 0
     
     # Apply color matching nếu cần
     if colored == "y":
-        lightness_obj = lightness_matching(obj_resized, bg_img, paste_start_y, paste_end_y, paste_start_x, paste_end_x)
-        # obj_blend = color_trans(obj_resized, bg_img)
-        obj_crop_blended = color_transfer_blend(object_mean_color, bg_img, mean_bg_color, alpha=0.2)
+        bg_crop = bg_img[paste_start_y:paste_end_y, paste_start_x:paste_end_x]
 
+        # # Debug stats: convert to Lab and inspect lightness (L) distribution.
+        # obj_rgb = obj_resized[:, :, :3].astype(np.uint8)
+        # obj_alpha_mask = obj_resized[:, :, 3] > 0 if obj_resized.shape[2] == 4 else np.ones(obj_resized.shape[:2], dtype=bool)
+        # obj_lab = cv2.cvtColor(obj_rgb, cv2.COLOR_RGB2Lab)
+        # bg_lab = cv2.cvtColor(bg_crop.astype(np.uint8), cv2.COLOR_BGR2Lab)
+
+        # obj_L_vals = obj_lab[:, :, 0][obj_alpha_mask].astype(np.float32)
+        # bg_L_vals = bg_lab[:, :, 0].reshape(-1).astype(np.float32)
+
+        # if obj_L_vals.size > 0:
+        #     obj_q1, obj_q2, obj_q3 = np.percentile(obj_L_vals, [25, 50, 75])
+        #     print(
+        #         "[L-Stats][obj_resized] "
+        #         f"mean={obj_L_vals.mean():.2f}, q1={obj_q1:.2f}, median={obj_q2:.2f}, "
+        #         f"q3={obj_q3:.2f}, min={obj_L_vals.min():.2f}, max={obj_L_vals.max():.2f}"
+        #     )
+        # else:
+        #     print("[L-Stats][obj_resized] No foreground pixels in alpha mask.")
+
+        # bg_q1, bg_q2, bg_q3 = np.percentile(bg_L_vals, [25, 50, 75])
+        # print(
+        #     "[L-Stats][bg_crop] "
+        #     f"mean={bg_L_vals.mean():.2f}, q1={bg_q1:.2f}, median={bg_q2:.2f}, "
+        #     f"q3={bg_q3:.2f}, min={bg_L_vals.min():.2f}, max={bg_L_vals.max():.2f}"
+        # )
+
+        # margin = obj_q3 - bg_q1
+        # if margin > 0:
+        #     obj_lab[:, :, 0] = np.clip(obj_lab[:, :, 0].astype(np.float32) - margin, 0, 255).astype(np.uint8)
+        #     print(f"[L-Stats][obj_resized] Adjusted mean={obj_lab[:, :, 0].mean():.2f}")
+        # else:
+        #     obj_lab[:, :, 0] = np.clip(obj_lab[:, :, 0].astype(np.float32) + margin, 0, 255).astype(np.uint8)
+        #     print(f"[L-Stats][obj_resized] Adjusted mean={obj_lab[:, :, 0].mean():.2f}")
+
+        # bgr_adjusted = cv2.cvtColor(obj_lab, cv2.COLOR_Lab2BGR)
+        # hsv_adjusted = cv2.cvtColor(bgr_adjusted, cv2.COLOR_BGR2HSV)
+        # S = hsv_adjusted[:, :, 1]
+        # S_bin = np.where(S >= 127, 255, 0).astype(np.uint8)
+        # hsv_adjusted[:, :, 1] = S_bin
+
+        # S = hsv_adjusted[:, :, 1].astype(np.float32) / 255.0
+        # V = hsv_adjusted[:, :, 2].astype(np.float32)
+
+        # delta = np.tanh((S - 0.5) * 2)  # smooth
+
+        # V = V * (1 + 0.5 * delta)
+
+        # hsv_adjusted[:, :, 2] = np.clip(V, 0, 255).astype(np.uint8)
+        
+        # kernel = np.ones((5, 5), np.uint8)
+        # obj_alpha_mask_uint8 = obj_alpha_mask.astype(np.uint8) * 255
+        # obj_alpha_mask_uint8 = cv2.erode(obj_alpha_mask_uint8, kernel, iterations=1)
+        # obj_alpha_mask = obj_alpha_mask_uint8 > 0
+        
+        # obj_blend = np.dstack([cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2RGB), obj_alpha_mask.astype(np.uint8) * 255])
+        
+        
+        # lightness_obj = lightness_matching_v2(obj_resized, bg_img, paste_start_y, paste_end_y, paste_start_x, paste_end_x)
+        # obj_blend = obj_resized.copy()
         # mean_bg_color = get_mean_color(bg_img, final_bbox)
-        obj_blend = pytorch_color_trans(input_image=obj_resized, ref_image=bg_img)
+        # obj_blend = color_transfer_blend(obj_resized, bg_img, mean_bg_color, alpha=0.2)
+        # obj_blend = color_trans(obj_resized, bg_img)
+        
+        
+        # obj_blend = color_trans_tiled(obj_resized, bg_crop, grid=32)  # 4x4 = 16 tiles
+        # obj_blend = transfer_gauss_region(obj_resized, bg_crop, mask=None, grid=(4, 4), blur_frac=0.3)
+        # obj_blend = switch_transfer(obj_resized, bg_crop)
+        # obj_blend = pytorch_color_trans(input_image=obj_resized, ref_image=bg_crop)
+        obj_blend = transfer_poisson_lum_multiplicative(obj_resized, bg_crop, mask=(obj_resized[:, :, 3] > 0).astype(np.uint8) * 255, strength=0.8)
+        # obj_blend = transfer_pyramid_lum(obj_resized, bg_crop, mask=(obj_resized[:, :, 3] > 0).astype(np.uint8) * 255, n_levels=5, cutoff=1)
+        # obj_blend = transfer_bilateral_lum(obj_resized, bg_crop, mask=(obj_resized[:, :, 3] > 0).astype(np.uint8) * 255,)
         source_rgba = np.array(obj_blend, dtype=np.uint8)
     else:
         source_rgba = obj_resized
@@ -741,7 +852,8 @@ if __name__ == '__main__':
     for i in range(num_images):
         boxes = []
         polygons = []  # Lưu polygon của mỗi object
-
+        j = 5
+        
         alpha_path_process = alpha_paths[i:i+num_objects] 
         # alpha_path_process = [alpha_paths[0]] * num_objects
         # alpha_path_process = random.sample(alpha_paths, min(num_objects, len(alpha_paths))) \
@@ -766,13 +878,21 @@ if __name__ == '__main__':
                 new_bg_img, alpha_img, alpha_path, ground_polygon, depth_map, 
                 ground_mask, colored, boxes=boxes, triangle_pts=triangle_area
             )
+            
+            if new_bg_img is None:
+                print(f"Failed to paste object from {alpha_path}, skipping...")
+                break
+        
+        
             boxes.append([x1, y1, x2, y2])
             polygons.append(obj_polygon)
         
             labeling_custom(img_bg_path, f"{img_folder}/out_{i+1}.png", alpha_path, 
                         x1/new_bg_img.width, y1/new_bg_img.height, 
                         x2/new_bg_img.width, y2/new_bg_img.height)
-            
+        if new_bg_img is None:
+            continue
+        
         cv_img = np.array(new_bg_img)
         
         for idx, box in enumerate(boxes):
