@@ -222,9 +222,10 @@ def transfer_poisson_lum_multiplicative(src_bgr, ref_bgr, mask, strength=0.5):
     ref_bgr_rs = cv2.resize(ref_bgr, (W, H)) if ref_bgr.shape[:2] != (H, W) else ref_bgr
     ref_lab = cv2.cvtColor(ref_bgr_rs.astype(np.float32) / 255.0, cv2.COLOR_BGR2Lab)
 
-    src_L = src_lab[:, :, 0] +50   # [0, 100]
-    ref_L = ref_lab[:, :, 0]   # [0, 100]
-    
+    src_L = src_lab[:, :, 0]   # [0, 100]
+    ref_L = ref_lab[:, :, 0]  # [0, 100]
+    print(f"src_L range: {src_L.min():.2f} - {src_L.max():.2f}- src_L mean: {src_L.mean():.2f}")
+    print(f"ref_L range: {ref_L.min():.2f} - {ref_L.max():.2f}- ref_L mean: {ref_L.mean():.2f}")
     # 2. Decompose mask → boundary ring + inner
     bin_mask      = (mask > 0).astype(np.uint8)
     if bin_mask.sum() == 0:
