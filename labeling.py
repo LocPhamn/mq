@@ -97,7 +97,7 @@ def labeling_grounding_dino(bg_path):
         print(f"Error during labeling: {e}")
 
 def labeling_custom(bg_path,img_path, label, x1, y1, x2, y2):
-    root = "generated_images/labels"
+    root = os.environ.get("GENERATED_LABEL_DIR", "generated_images/labels")
     bg_label = "labels/bg_images"           
     x_center, y_center = (x1 + x2) / 2, (y1 + y2) / 2
     width, height = x2 - x1, y2 - y1
@@ -140,7 +140,7 @@ def labeling_custom(bg_path,img_path, label, x1, y1, x2, y2):
 
 def labeling_custom_stockbridge(bg_path,img_path, label, x1, y1, x2, y2):
     
-    root = "generated_images/labels"        
+    root = os.environ.get("GENERATED_LABEL_DIR", "generated_images/labels")
     bg_label = "labels/bg_images/labels"           
     x_center, y_center = (x1 + x2) / 2, (y1 + y2) / 2
     width, height = x2 - x1, y2 - y1

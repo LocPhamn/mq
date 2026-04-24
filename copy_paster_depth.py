@@ -377,65 +377,19 @@ def paste_object_with_alpha(bg_img, obj_rgba,alpha_path, ground_polygon, depth_m
     
     # Apply color matching nếu cần
     if colored == "y":
-        bg_crop = bg_img[paste_start_y:paste_end_y, paste_start_x:paste_end_x]
-
         # Debug stats: convert to Lab and inspect lightness (L) distribution.
         obj_rgb = obj_resized[:, :, :3].astype(np.uint8)
-        obj_alpha_mask = obj_resized[:, :, 3] > 0 if obj_resized.shape[2] == 4 else np.ones(obj_resized.shape[:2], dtype=bool)
-        obj_lab = cv2.cvtColor(obj_rgb, cv2.COLOR_RGB2Lab)
-        bg_lab = cv2.cvtColor(bg_crop.astype(np.uint8), cv2.COLOR_BGR2Lab)
-
-        obj_L_vals = obj_lab[:, :, 0][obj_alpha_mask].astype(np.float32)
-        bg_L_vals = bg_lab[:, :, 0].reshape(-1).astype(np.float32)
-
-        if obj_L_vals.size > 0:
-            obj_q1, obj_q2, obj_q3 = np.percentile(obj_L_vals, [25, 50, 75])
-            print(
-                "[L-Stats][obj_resized] "
-                f"mean={obj_L_vals.mean():.2f}, q1={obj_q1:.2f}, median={obj_q2:.2f}, "
-                f"q3={obj_q3:.2f}, min={obj_L_vals.min():.2f}, max={obj_L_vals.max():.2f}"
-            )
-        else:
-            print("[L-Stats][obj_resized] No foreground pixels in alpha mask.")
-
-        bg_q1, bg_q2, bg_q3 = np.percentile(bg_L_vals, [25, 50, 75])
-        print(
-            "[L-Stats][bg_crop] "
-            f"mean={bg_L_vals.mean():.2f}, q1={bg_q1:.2f}, median={bg_q2:.2f}, "
-            f"q3={bg_q3:.2f}, min={bg_L_vals.min():.2f}, max={bg_L_vals.max():.2f}"
-        )
-
-        margin = obj_q3 - bg_q1
-        if margin > 0:
-            obj_lab[:, :, 0] = np.clip(obj_lab[:, :, 0].astype(np.float32) - margin, 0, 255).astype(np.uint8)
-            print(f"[L-Stats][obj_resized] Adjusted mean={obj_lab[:, :, 0].mean():.2f}")
-        else:
-            obj_lab[:, :, 0] = np.clip(obj_lab[:, :, 0].astype(np.float32) + margin, 0, 255).astype(np.uint8)
-            print(f"[L-Stats][obj_resized] Adjusted mean={obj_lab[:, :, 0].mean():.2f}")
-
-        bgr_adjusted = cv2.cvtColor(obj_lab, cv2.COLOR_Lab2BGR)
-        hsv_adjusted = cv2.cvtColor(bgr_adjusted, cv2.COLOR_BGR2HSV)
-        S = hsv_adjusted[:, :, 1]
-        S_bin = np.where(S >= 127, 255, 0).astype(np.uint8)
-        hsv_adjusted[:, :, 1] = S_bin
-
-        S = hsv_adjusted[:, :, 1].astype(np.float32) / 255.0
-        V = hsv_adjusted[:, :, 2].astype(np.float32)
-
-        delta = np.tanh((S - 0.5) * 2)  # smooth
-
-        V = V * (1 + 0.5 * delta)
-
-        hsv_adjusted[:, :, 2] = np.clip(V, 0, 255).astype(np.uint8)
+        obj_alpha_mask = obj_resized[:, :, 3] > 0
         
         kernel = np.ones((5, 5), np.uint8)
         obj_alpha_mask_uint8 = obj_alpha_mask.astype(np.uint8) * 255
         obj_alpha_mask_uint8 = cv2.erode(obj_alpha_mask_uint8, kernel, iterations=1)
         obj_alpha_mask = obj_alpha_mask_uint8 > 0
-        
-        obj_blend = np.dstack([cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2RGB), obj_alpha_mask.astype(np.uint8) * 255])
-        
-        
+
+        bg_crop = bg_img[paste_start_y:paste_end_y, paste_start_x:paste_end_x]
+        bg_crop_obj_mask = np.zeros_like(bg_crop)
+        bg_crop_obj_mask[obj_alpha_mask] = bg_crop[obj_alpha_mask]
+      
         # lightness_obj = lightness_matching_v2(obj_resized, bg_img, paste_start_y, paste_end_y, paste_start_x, paste_end_x)
         # obj_blend = obj_resized.copy()
         # mean_bg_color = get_mean_color(bg_img, final_bbox)
@@ -447,22 +401,20 @@ def paste_object_with_alpha(bg_img, obj_rgba,alpha_path, ground_polygon, depth_m
         # obj_blend = transfer_gauss_region(obj_resized, bg_crop, mask=None, grid=(4, 4), blur_frac=0.3)
         # obj_blend = switch_transfer(obj_resized, bg_crop)
         # obj_blend = pytorch_color_trans(input_image=obj_resized, ref_image=bg_crop)
-        obj_blend = transfer_poisson_lum_multiplicative(obj_resized, bg_crop, mask=obj_alpha_mask, strength=0.3)
-        obj_blend_hsv = cv2.cvtColor(obj_blend, cv2.COLOR_RGB2HSV)
-        hsv_adjusted = obj_blend_hsv.copy()
-        S = hsv_adjusted[:, :, 1]
-        S_bin = np.where(S >= 127, 255, 0).astype(np.uint8)
-        hsv_adjusted[:, :, 1] = S_bin
-
-        S = hsv_adjusted[:, :, 1].astype(np.float32) / 255.0
-        V = hsv_adjusted[:, :, 2].astype(np.float32)
-
-        delta = np.tanh((S - 0.5) * 2)  # smooth
-
-        V = V * (1 + 0.5 * delta)
-
-        hsv_adjusted[:, :, 2] = np.clip(V, 0, 255).astype(np.uint8)
-        obj_blend = np.dstack([cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2RGB), obj_alpha_mask.astype(np.uint8) * 255])
+        boundary_pad_px = 2  # Set n pixels for thicker boundary constraints.
+        obj_blend, processed_s = transfer_poisson_lum_multiplicative(
+            obj_resized,
+            bg_crop_obj_mask,
+            mask=obj_alpha_mask,
+            strength=0.3,
+            boundary_pad=boundary_pad_px,
+        )
+        # obj_blend_rgb = obj_blend[:, :, :3] if obj_blend.ndim == 3 and obj_blend.shape[2] > 3 else obj_blend
+        # obj_blend_hsv = cv2.cvtColor(obj_blend_rgb, cv2.COLOR_RGB2HSV)
+        # hsv_adjusted = obj_blend_hsv.copy()
+        # hsv_adjusted[:, :, 1] = processed_s
+      
+        # obj_blend = np.dstack([cv2.cvtColor(hsv_adjusted, cv2.COLOR_HSV2RGB), obj_alpha_mask.astype(np.uint8) * 255])
 
         # obj_blend = transfer_pyramid_lum(obj_resized, bg_crop, mask=(obj_resized[:, :, 3] > 0).astype(np.uint8) * 255, n_levels=5, cutoff=1)
         # obj_blend = transfer_bilateral_lum(obj_resized, bg_crop, mask=(obj_resized[:, :, 3] > 0).astype(np.uint8) * 255,)
@@ -721,12 +673,22 @@ def send_to_hunyuan3d(image_path, yaw_deg, hunyuan_url, output_dir, pitch_deg=0,
     except Exception as exc:
         print(f"Hunyuan3D request failed: {exc}")
         return None
+
+
+def derive_label_dir(output_dir: str) -> str:
+    output_path = Path(output_dir)
+    parts = list(output_path.parts)
+    if "images" in parts:
+        parts[parts.index("images")] = "labels"
+        return str(Path(*parts))
+    return "generated_images/labels"
     
 
 if __name__ == '__main__':
     args = argument_parser()
     img_folder = args.output_dir
-    label_folder = "generated_images/labels"
+    label_folder = derive_label_dir(img_folder)
+    os.environ["GENERATED_LABEL_DIR"] = label_folder
     img_bg_path = f"images/bg_images/{args.background_path}"
     num_images = args.image_num
     num_objects = args.object_num 
@@ -745,7 +707,7 @@ if __name__ == '__main__':
     postprocess_vehicles = [os.path.join("images/upview_vehicles/postprocess", f) for f in os.listdir("images/upview_vehicles/postprocess")]
 
     # horizontal vehicle paths
-    all_vehicle_paths = [os.path.join("images/vehicles", f) for f in os.listdir("images/vehicles")]
+    # all_vehicle_paths = [os.path.join("images/vehicles", f) for f in os.listdir("images/vehicles")]
     # all_vehicle_paths = [""]
     
     alpha_paths = []
@@ -886,7 +848,7 @@ if __name__ == '__main__':
             if alpha_path == "alpha_images/construction_truck.png":
                 continue
              
-            alpha_img = cv2.imread("alpha_clean/construction_truck-868-_png.rf.7d5431bfe6ed9e3c8fe9ad9995d1dacc.png", cv2.IMREAD_UNCHANGED)
+            alpha_img = cv2.imread(alpha_path, cv2.IMREAD_UNCHANGED)
             alpha_img, bbox = get_tight_bbox_from_alpha(alpha_img)
             alpha_img = cv2.cvtColor(alpha_img, cv2.COLOR_BGRA2RGBA)
             

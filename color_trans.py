@@ -214,135 +214,146 @@ def pytorch_color_trans(input_image=None, ref_image=None):
     # --- 6. Save ---
     return img_arr_mlt
 
-def transfer_poisson_lum_multiplicative(src_bgr, ref_bgr, mask, strength=0.5):
+def transfer_poisson_lum_multiplicative(src_bgr, ref_bgr, mask, strength=0.5, boundary_pad=0):
     H, W = src_bgr.shape[:2]
 
-    # 1. Convert to LAB float32
-    src_lab = cv2.cvtColor(src_bgr.astype(np.float32) / 255.0, cv2.COLOR_BGR2Lab)
-    ref_bgr_rs = cv2.resize(ref_bgr, (W, H)) if ref_bgr.shape[:2] != (H, W) else ref_bgr
+    # --- Chuẩn bị ảnh ---
+    src_bgr_3 = src_bgr[:, :, :3] if src_bgr.ndim == 3 and src_bgr.shape[2] > 3 else src_bgr
+    ref_bgr_3 = ref_bgr[:, :, :3] if ref_bgr.ndim == 3 and ref_bgr.shape[2] > 3 else ref_bgr
+
+    src_lab = cv2.cvtColor(src_bgr_3.astype(np.float32) / 255.0, cv2.COLOR_BGR2Lab)
+    ref_bgr_rs = cv2.resize(ref_bgr_3, (W, H)) if ref_bgr_3.shape[:2] != (H, W) else ref_bgr_3
     ref_lab = cv2.cvtColor(ref_bgr_rs.astype(np.float32) / 255.0, cv2.COLOR_BGR2Lab)
 
-    src_L = src_lab[:, :, 0]   # [0, 100]
-    ref_L = ref_lab[:, :, 0]  # [0, 100]
-    print(f"src_L range: {src_L.min():.2f} - {src_L.max():.2f}- src_L mean: {src_L.mean():.2f}")
-    print(f"ref_L range: {ref_L.min():.2f} - {ref_L.max():.2f}- ref_L mean: {ref_L.mean():.2f}")
-    # 2. Decompose mask → boundary ring + inner
-    bin_mask      = (mask > 0).astype(np.uint8)
+    src_hsv = cv2.cvtColor(src_bgr_3.astype(np.uint8), cv2.COLOR_BGR2HSV)
+    ref_hsv = cv2.cvtColor(ref_bgr_rs.astype(np.uint8), cv2.COLOR_BGR2HSV)
+
+    src_L = src_lab[:, :, 0]                          # [0, 100]
+    ref_L = ref_lab[:, :, 0]
+    src_S = src_hsv[:, :, 1].astype(np.float64)       # [0, 255]
+    ref_S = ref_hsv[:, :, 1].astype(np.float64)
+
+    print(f"src_L range: {src_L.min():.2f} - {src_L.max():.2f}, mean: {src_L.mean():.2f}")
+    print(f"ref_L range: {ref_L.min():.2f} - {ref_L.max():.2f}, mean: {ref_L.mean():.2f}")
+
+    # --- Mask ---
+    bin_mask = (mask > 0).astype(np.uint8)
     if bin_mask.sum() == 0:
-        return src_bgr.copy()
+        return postprocess(src_bgr_3.copy(), mask), src_hsv[:, :, 1].copy()
 
-    kernel        = np.ones((3, 3), np.uint8)
-    eroded        = cv2.erode(bin_mask, kernel, iterations=1)
+    kernel = np.ones((3, 3), np.uint8)
+    eroded = cv2.erode(bin_mask, kernel, iterations=1)
     boundary_mask = (bin_mask - eroded).clip(0, 1)
-    inner_mask    = eroded
-    
 
-    # Scale field tại mỗi pixel: w = ref_L / (src_L + 1)
-    # Multiplicative Laplacian: dùng ADDITIVE đi vào, MULTIPLICATIVE khi apply
-    w_field = ref_L / (src_L + 1.0)   # shape (H,W), ∈ [0, ~100]
-    w_field = np.clip(w_field, 1e-6, 1e4)  # Safeguard from extreme values
+    # Optional: thicken boundary band inward by n pixels while keeping it inside mask.
+    pad = max(0, int(boundary_pad))
+    if pad > 0:
+        pad_kernel = np.ones((2 * pad + 1, 2 * pad + 1), np.uint8)
+        boundary_mask = cv2.dilate(boundary_mask, pad_kernel, iterations=1)
+        boundary_mask = ((boundary_mask > 0) & (bin_mask > 0)).astype(np.uint8)
 
-    if inner_mask.sum() == 0:
-        exit()
-        # Mask quá mỏng → áp w trực tiếp
-        result_lab = src_lab.copy()
-        result_lab[:, :, 0] = np.where(
-            bin_mask.astype(bool),
-            np.clip((1 - strength) * src_L + strength * src_L * w_field, 0, 100),
-            src_L
-        )
-        out = cv2.cvtColor(result_lab, cv2.COLOR_Lab2BGR)
-        return np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    inner_mask = ((bin_mask > 0) & (boundary_mask == 0)).astype(np.uint8)
+    bin_mask_bool = bin_mask.astype(bool)
 
-    # 3. Index tất cả pixel trong mask
+    # --- Index sparse pixels ---
     coords_all = np.argwhere(bin_mask > 0)
-    n          = len(coords_all)
-    idx        = -np.ones((H, W), dtype=np.int32)
+    n = len(coords_all)
+    idx = -np.ones((H, W), dtype=np.int32)
     idx[coords_all[:, 0], coords_all[:, 1]] = np.arange(n)
 
-    ys, xs      = coords_all[:, 0], coords_all[:, 1]
-    is_inner    = inner_mask[ys, xs].astype(bool)
+    ys, xs = coords_all[:, 0], coords_all[:, 1]
+    is_inner = inner_mask[ys, xs].astype(bool)
     is_boundary = boundary_mask[ys, xs].astype(bool)
-    inn_ids     = np.where(is_inner)[0]
-    bnd_ids     = np.where(is_boundary)[0]
+    inn_ids = np.where(is_inner)[0]
+    bnd_ids = np.where(is_boundary)[0]
 
-    # 4. Build Ax = b (ADDITIVE Laplacian for smooth scale field)
-    #
-    #   [Boundary] : w_i = w_field_i                 → anchor to target ratio
-    #   [Inner]    : Additive Laplacian (smooth interpolation):
-    #                4·w_i - w_top - w_bot - w_left - w_right = 0
-    #                nếu láng giềng ngoài mask → dùng w_j = w_field_j (Dirichlet BC)
-    #
-    #   Applied multiplicatively: solved_L = src_L * w
-    #   This preserves tonal structure (blacks stay black)
-    #
-    b        = np.zeros(n, dtype=np.float64)
-    all_rows = []
-    all_cols = []
-    all_vals = []
+    def solve_multiplicative_channel(src_ch, ref_ch, ch_max):
+        """
+        Multiplicative Laplacian Poisson:
+          w_field  = ref / (src + eps)   ← tỉ lệ mong muốn tại mỗi pixel
+          Laplacian Poisson solve: Δw = 0 bên trong, w = w_field tại biên
+          → w mượt bên trong, anchored tại viền mask
+          Kết quả: result = src * w_solved  (multiplicative apply)
+        """
+        src_ch = src_ch.astype(np.float64)
+        ref_ch = ref_ch.astype(np.float64)
 
-    # ── Boundary rows: w_i = w_field_i ──────────────────────────────────
-    b[bnd_ids] = w_field[ys[bnd_ids], xs[bnd_ids]].astype(np.float64)
-    all_rows.append(bnd_ids)
-    all_cols.append(bnd_ids)
-    all_vals.append(np.ones(len(bnd_ids)))
+        # Multiplicative guidance field
+        w_field = np.clip(ref_ch / (src_ch + 1.0), 1e-6, 1e4)
 
-    # ── Inner rows: 4·w_i - sum(neighbors) = 0 ──────────────────────────
-    all_rows.append(inn_ids)
-    all_cols.append(inn_ids)
-    all_vals.append(np.full(len(inn_ids), 4.0))   # diagonal = 4
+        # Nếu mask quá mỏng (không có inner), áp w trực tiếp
+        if inner_mask.sum() == 0:
+            blended = np.clip((1.0 - strength) * src_ch + strength * src_ch * w_field, 0.0, ch_max)
+            return np.where(bin_mask_bool, blended, src_ch)
 
-    for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-        nys = ys[inn_ids] + dy
-        nxs = xs[inn_ids] + dx
+        b = np.zeros(n, dtype=np.float64)
+        rows, cols, vals = [], [], []
 
-        in_bounds     = (nys >= 0) & (nys < H) & (nxs >= 0) & (nxs < W)
-        nys_c         = np.clip(nys, 0, H - 1)
-        nxs_c         = np.clip(nxs, 0, W - 1)
-        j_vals        = idx[nys_c, nxs_c]
+        # ── Boundary: w_i = w_field_i (Dirichlet BC) ──
+        b[bnd_ids] = w_field[ys[bnd_ids], xs[bnd_ids]]
+        rows.append(bnd_ids);  cols.append(bnd_ids);  vals.append(np.ones(len(bnd_ids)))
 
-        in_mask_flag  = in_bounds & (j_vals >= 0)   # láng giềng trong mask
-        out_mask_flag = in_bounds & (j_vals < 0)    # láng giềng ngoài mask
+        # ── Inner: Δw = 0  →  4·w_i - Σ w_j = 0 ──
+        rows.append(inn_ids);  cols.append(inn_ids);  vals.append(np.full(len(inn_ids), 4.0))
 
-        # Off-diagonal -1 cho láng giềng trong mask
-        all_rows.append(inn_ids[in_mask_flag])
-        all_cols.append(j_vals[in_mask_flag])
-        all_vals.append(np.full(int(in_mask_flag.sum()), -1.0))
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            nys = ys[inn_ids] + dy
+            nxs = xs[inn_ids] + dx
+            in_bounds = (nys >= 0) & (nys < H) & (nxs >= 0) & (nxs < W)
+            nys_c = np.clip(nys, 0, H - 1)
+            nxs_c = np.clip(nxs, 0, W - 1)
+            j_vals = idx[nys_c, nxs_c]
 
-        # Dirichlet BC: láng giềng ngoài mask dùng w_field tại đó
-        w_outside = w_field[nys[out_mask_flag], nxs[out_mask_flag]].astype(np.float64)
-        b[inn_ids[out_mask_flag]] += w_outside
+            in_mask_flag  = in_bounds & (j_vals >= 0)   # neighbor trong mask
+            out_mask_flag = in_bounds & (j_vals < 0)    # neighbor ngoài mask → Dirichlet BC
 
-    A = scipy.sparse.csr_matrix(
-        (np.concatenate(all_vals),
-         (np.concatenate(all_rows), np.concatenate(all_cols))),
-        shape=(n, n)
-    )
+            # off-diagonal -1
+            rows.append(inn_ids[in_mask_flag])
+            cols.append(j_vals[in_mask_flag])
+            vals.append(np.full(in_mask_flag.sum(), -1.0))
 
-    # 5. Solve Aw = b  →  w smooth bên trong, anchored tại biên
-    try:
-        x = scipy.sparse.linalg.spsolve(A, b)
-        x = np.nan_to_num(x, nan=1.0, posinf=10.0, neginf=0.1)
-    except Exception:
-        return transfer_keep_hue(src_bgr, ref_bgr, mask=mask)
+            # neighbor ngoài mask: dùng w_field tại đó làm BC
+            b[inn_ids[out_mask_flag]] += w_field[nys[out_mask_flag], nxs[out_mask_flag]]
 
-    # 6. Apply multiplicatively: solved_L = src_L * w
-    # This preserves tonal structure - black stays black, proportions maintained
-    w_solved         = np.ones((H, W), dtype=np.float64)
-    w_solved[ys, xs] = np.clip(x, 0.01, 100.0)   # Clip w vào range hợp lý
-    
-    solved_L = src_L * w_solved                   # multiplicative blend
-    solved_L = np.clip(solved_L, 0.0, 100.0)
+        A = scipy.sparse.csr_matrix(
+            (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+            shape=(n, n)
+        )
 
-    result_L = (1.0 - strength) * src_L + strength * solved_L
+        try:
+            x = scipy.sparse.linalg.spsolve(A, b)
+            x = np.nan_to_num(x, nan=1.0, posinf=10.0, neginf=0.1)
+        except Exception:
+            return src_ch.copy()
 
-    # 7. Ghép lại, A/B giữ nguyên
-    result_lab          = src_lab.copy()
+        # w_solved smooth bên trong mask, = w_field tại biên
+        w_solved = np.ones((H, W), dtype=np.float64)
+        w_solved[ys, xs] = np.clip(x, 0.01, ch_max)
+
+        # Multiplicative apply + strength blend
+        solved = np.clip(src_ch * w_solved, 0.0, ch_max)
+        return np.clip((1.0 - strength) * src_ch + strength * solved, 0.0, ch_max)
+
+    # --- Solve L (LAB) ---
+    result_L = solve_multiplicative_channel(src_L, ref_L, 100.0)
+
+    # --- Solve S (HSV) ---
+    result_S = solve_multiplicative_channel(src_S, ref_S, 255.0)
+
+    # --- Apply L back vào LAB → BGR ---
+    result_lab = src_lab.copy()
     result_lab[:, :, 0] = result_L
-    out = cv2.cvtColor(result_lab, cv2.COLOR_Lab2BGR)
-    return postprocess(np.clip(out * 255.0, 0, 255).astype(np.uint8), mask)
+    out_bgr = cv2.cvtColor(result_lab.astype(np.float32), cv2.COLOR_Lab2BGR)
+    out_bgr = np.clip(out_bgr * 255.0, 0, 255).astype(np.uint8)
 
-def transfer_poisson_lum(src_bgr, ref_bgr, mask, strength=0.5):
+    # --- Apply S back vào HSV → BGR ---
+    out_hsv = cv2.cvtColor(out_bgr, cv2.COLOR_BGR2HSV)
+    out_hsv[:, :, 1] = result_S.astype(np.uint8)
+    out_bgr = cv2.cvtColor(out_hsv, cv2.COLOR_HSV2BGR)
+
+    return postprocess(out_bgr, mask), result_S.astype(np.uint8)
+
+def transfer_poisson_lum(src_bgr, ref_bgr, mask, strength=0.5, boundary_pad=0):
     H, W = src_bgr.shape[:2]
 
     src_lab = cv2.cvtColor(src_bgr.astype(np.float32) / 255.0, cv2.COLOR_BGR2Lab)
@@ -359,7 +370,15 @@ def transfer_poisson_lum(src_bgr, ref_bgr, mask, strength=0.5):
     kernel        = np.ones((3, 3), np.uint8)
     eroded        = cv2.erode(bin_mask, kernel, iterations=1)
     boundary_mask = (bin_mask - eroded).clip(0, 1)
-    inner_mask    = eroded
+
+    # Optional: thicken boundary band inward by n pixels while keeping it inside mask.
+    pad = max(0, int(boundary_pad))
+    if pad > 0:
+        pad_kernel = np.ones((2 * pad + 1, 2 * pad + 1), np.uint8)
+        boundary_mask = cv2.dilate(boundary_mask, pad_kernel, iterations=1)
+        boundary_mask = ((boundary_mask > 0) & (bin_mask > 0)).astype(np.uint8)
+
+    inner_mask    = ((bin_mask > 0) & (boundary_mask == 0)).astype(np.uint8)
 
     if inner_mask.sum() == 0:
         result_lab = src_lab.copy()
